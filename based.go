@@ -1,6 +1,7 @@
 package based
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -8,10 +9,12 @@ import (
 )
 
 var (
-	RawStdBase32Bytes = NewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"))
-	RawHexBase32Bytes = NewEncoding([]byte("0123456789ABCDEFGHIJKLMNOPQRSTUV"))
-	RawStdBase64Bytes = NewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
-	RawURLBase64Bytes = NewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"))
+	Base32RawEncoding    = MustNewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"))
+	Base32RawHexEncoding = MustNewEncoding([]byte("0123456789ABCDEFGHIJKLMNOPQRSTUV"))
+	Base64Encoding       = MustNewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"), byte('='))
+	Base64URLEncoding    = MustNewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"), byte('='))
+	Base64RawEncoding    = MustNewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"))
+	Base64RawURLEncoding = MustNewEncoding([]byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"))
 )
 
 type Encoding[Dict ~[]Word, Word comparable] struct {
@@ -20,39 +23,65 @@ type Encoding[Dict ~[]Word, Word comparable] struct {
 	size         uint64
 	stepBits     uint8
 	offsetToggle uint64
+	padding      *Word
 }
 
-func NewEncoding[Dict ~[]Word, Word comparable](dict Dict) *Encoding[Dict, Word] {
+func MustNewEncoding[Dict ~[]Word, Word comparable](dict Dict, padding ...Word) *Encoding[Dict, Word] {
+	enc, err := NewEncoding(dict, padding...)
+	if err != nil {
+		panic(err)
+	}
+
+	return enc
+}
+
+func NewEncoding[Dict ~[]Word, Word comparable](dict Dict, padding ...Word) (*Encoding[Dict, Word], error) {
 	if len(dict) < 2 {
-		panic("dict must have at least 2 words")
+		return nil, errors.New("dict must have at least 2 words")
+	} else if len(padding) > 1 {
+		return nil, errors.New("padding must have at most 1 word")
 	}
 
 	enc := Encoding[Dict, Word]{
-		dict: dict,
-		idx:  make(map[Word]uint64),
-		size: uint64(len(dict)),
+		dict:    slices.Clone(dict),
+		idx:     make(map[Word]uint64),
+		size:    uint64(len(dict)),
+		padding: nil,
 	}
 
-	for i, w := range dict {
+	// len-1 = max index
+	stepBits := bits.Len64(enc.size - 1)
+	if stepBits == bits.Len64(enc.size) {
+		enc.stepBits = uint8(stepBits - 1)
+		enc.offsetToggle = ^uint64(0)
+	} else {
+		enc.stepBits = uint8(stepBits)
+		enc.offsetToggle = 0
+	}
+
+	if enc.stepBits > 8 && len(padding) < 1 {
+		return nil, errors.New("encoding with a dictionary of 512 or more words (more than 8 bits per token) require padding")
+	}
+
+	if len(padding) == 1 {
+		padWord := padding[0]
+		enc.padding = &padWord
+	}
+
+	for i, w := range enc.dict {
+		if enc.padding != nil && w == *enc.padding {
+			return nil, fmt.Errorf("padding word must not be part of dict; found %v at %d\n", w, i)
+		}
+
 		_, ok := enc.idx[w]
 		if ok {
-			panic(fmt.Sprintf("dict must consist of unique words; found duplicate %v at %d\n", w, i))
+			return nil, fmt.Errorf("dict must consist of unique words; found duplicate %v at %d\n", w, i)
 		}
 
 		enc.idx[w] = uint64(i)
 	}
 
-	// len-1 = max index
-	size := bits.Len64(enc.size - 1)
-	if size == bits.Len64(enc.size) {
-		enc.stepBits = uint8(size - 1)
-		enc.offsetToggle = ^uint64(0)
-	} else {
-		enc.stepBits = uint8(size)
-		enc.offsetToggle = 0
-	}
-
-	return &enc
+	return &enc, nil
 }
 
 func (enc *Encoding[Dict, Word]) Encode(dst []Word, src []byte) {
@@ -60,9 +89,7 @@ func (enc *Encoding[Dict, Word]) Encode(dst []Word, src []byte) {
 	var availBits uint8
 
 	n := enc.encode(dst, src, &index, &offset, &availBits)
-	if availBits > 0 {
-		enc.add(dst, &index, &offset, &availBits, &n)
-	}
+	enc.finalize(dst, &index, &offset, &availBits, &n)
 }
 
 func (enc *Encoding[Dict, Word]) encode(dst []Word, src []byte, index, offset *uint64, availBits *uint8) (n int) {
@@ -113,6 +140,26 @@ func (enc *Encoding[Dict, Word]) add(dst []Word, index, offset *uint64, availBit
 	*availBits = 0
 }
 
+func (enc *Encoding[Dict, Word]) finalize(dst []Word, index, offset *uint64, availBits *uint8, dstIdx *int) {
+	payloadLen := *dstIdx
+	if *availBits > 0 {
+		payloadLen++
+	}
+	padCount := enc.padLen(payloadLen, *availBits)
+
+	if *availBits > 0 {
+		enc.add(dst, index, offset, availBits, dstIdx)
+	}
+
+	if padCount > 0 {
+		padWord := *enc.padding
+		for range padCount {
+			dst[*dstIdx] = padWord
+			*dstIdx++
+		}
+	}
+}
+
 func (enc *Encoding[Dict, Word]) AppendEncode(dst []Word, src []byte) []Word {
 	n := enc.EncodedLen(len(src))
 	dst = slices.Grow(dst, n)
@@ -127,18 +174,48 @@ func (enc *Encoding[Dict, Word]) EncodedLen(n int) int {
 func (enc *Encoding[Dict, Word]) encodedLen(n int, availBits uint8) int {
 	lenBits := (n * 8) + int(availBits)
 	stepBits := int(enc.stepBits)
-
-	if lenBits%stepBits == 0 {
-		return lenBits / stepBits
+	if lenBits == 0 {
+		return 0
 	}
 
-	return (lenBits / stepBits) + 1
+	payloadLen := lenBits / stepBits
+	if lenBits%stepBits != 0 {
+		payloadLen++
+	}
+
+	return payloadLen + enc.padLen(payloadLen, uint8(lenBits%stepBits))
+}
+
+func (enc *Encoding[Dict, Word]) padLen(payloadLen int, availBits uint8) int {
+	if enc.padding == nil || availBits == 0 {
+		return 0
+	}
+
+	if enc.stepBits <= 8 {
+		blockLen := 8 / gcdInt(int(enc.stepBits), 8)
+		return (blockLen - (payloadLen % blockLen)) % blockLen
+	}
+
+	return int((enc.stepBits - availBits) / 8)
+}
+
+func gcdInt(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+
+	return a
 }
 
 func (enc *Encoding[Dict, Word]) Decode(dst []byte, src []Word) (n int, err error) {
 	var offset uint64
 	var partial byte
 	var partialBits uint8
+
+	src, padCount, err := enc.trimPadding(src)
+	if err != nil {
+		return 0, err
+	}
 
 	n, err = enc.decode(dst, src, &offset, &partial, &partialBits)
 	if err != nil {
@@ -147,7 +224,71 @@ func (enc *Encoding[Dict, Word]) Decode(dst []byte, src []Word) (n int, err erro
 		return n, fmt.Errorf("finished with remaining partial bits [partial=%08b, partialBits=%08b]", partial, partialBits)
 	}
 
+	if enc.stepBits > 8 && padCount > 0 {
+		if padCount > n {
+			return n, fmt.Errorf("padding removes %d bytes from %d decoded bytes", padCount, n)
+		}
+
+		for i := n - padCount; i < n; i++ {
+			if dst[i] != 0 {
+				return n, fmt.Errorf("non-zero byte %08b removed by padding at decoded index %d", dst[i], i)
+			}
+		}
+
+		n -= padCount
+	}
+
 	return n, nil
+}
+
+func (enc *Encoding[Dict, Word]) trimPadding(src []Word) ([]Word, int, error) {
+	if enc.padding == nil {
+		return src, 0, nil
+	}
+
+	padWord := *enc.padding
+	padCount := 0
+	for len(src) > 0 && src[len(src)-1] == padWord {
+		src = src[:len(src)-1]
+		padCount++
+	}
+
+	for i, w := range src {
+		if w == padWord {
+			return nil, 0, fmt.Errorf("padding word at index %d before end", i)
+		}
+	}
+
+	return src, padCount, enc.validatePadding(len(src), padCount)
+}
+
+func (enc *Encoding[Dict, Word]) validatePadding(payloadLen, padCount int) error {
+	if enc.stepBits <= 8 {
+		blockLen := 8 / gcdInt(int(enc.stepBits), 8)
+		expected := (blockLen - (payloadLen % blockLen)) % blockLen
+		if padCount != expected {
+			return fmt.Errorf("invalid padding length %d, expected %d", padCount, expected)
+		}
+
+		return nil
+	}
+
+	if padCount == 0 {
+		return nil
+	}
+
+	if payloadLen == 0 {
+		return errors.New("padding without encoded data")
+	}
+
+	maxDecodedLen := (payloadLen * int(enc.stepBits)) / 8
+	minDecodedLen := (((payloadLen - 1) * int(enc.stepBits)) / 8) + 1
+	maxPadLen := maxDecodedLen - minDecodedLen
+	if padCount > maxPadLen {
+		return fmt.Errorf("invalid padding length %d, expected at most %d", padCount, maxPadLen)
+	}
+
+	return nil
 }
 
 func (enc *Encoding[Dict, Word]) decode(dst []byte, src []Word, offset *uint64, partial *byte, partialBits *uint8) (n int, err error) {
@@ -205,12 +346,13 @@ func (enc *Encoding[Dict, Word]) DecodedLen(n int) int {
 }
 
 type writer[Dict ~[]Word, Word comparable] struct {
-	enc       *Encoding[Dict, Word]
-	w         interface{ Write(b []Word) (int, error) }
-	buf       []Word
-	index     uint64
-	offset    uint64
-	availBits uint8
+	enc        *Encoding[Dict, Word]
+	w          interface{ Write(b []Word) (int, error) }
+	buf        []Word
+	index      uint64
+	offset     uint64
+	availBits  uint8
+	payloadLen int
 }
 
 func NewWriter[Dict ~[]Word, Word comparable](enc *Encoding[Dict, Word], w interface{ Write(b []Word) (int, error) }) io.WriteCloser {
@@ -225,22 +367,63 @@ func (w *writer[Dict, Word]) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 
-	n = w.enc.encodedLen(len(p), w.availBits)
-	w.buf = slices.Grow(w.buf, n)
-	n = w.enc.encode(w.buf[len(w.buf):][:n], p, &w.index, &w.offset, &w.availBits)
+	encodedLen := w.enc.encodedLen(len(p), w.availBits)
+	w.buf = slices.Grow(w.buf[:0], encodedLen)
+	encoded := w.buf[:encodedLen]
+	encodedLen = w.enc.encode(encoded, p, &w.index, &w.offset, &w.availBits)
+	if encodedLen == 0 {
+		return len(p), nil
+	}
 
-	return w.w.Write(w.buf[:len(w.buf)+n])
+	written, err := w.w.Write(encoded[:encodedLen])
+	if err != nil {
+		return 0, err
+	}
+	if written != encodedLen {
+		return 0, io.ErrShortWrite
+	}
+
+	w.payloadLen += encodedLen
+	return len(p), nil
 }
 
 func (w *writer[Dict, Word]) Close() error {
-	var err error
-	if w.buf != nil && w.availBits > 0 {
-		var n int
-		w.enc.add(w.buf[len(w.buf):][:1], &w.index, &w.offset, &w.availBits, &n)
-		_, err = w.w.Write(w.buf[:len(w.buf)+n])
+	payloadLen := w.payloadLen
+	if w.availBits > 0 {
+		payloadLen++
+	}
+	padLen := w.enc.padLen(payloadLen, w.availBits)
+	finalLen := padLen
+	if w.availBits > 0 {
+		finalLen++
+	}
+	if finalLen == 0 {
+		return nil
 	}
 
-	return err
+	w.buf = slices.Grow(w.buf[:0], finalLen)
+	final := w.buf[:finalLen]
+	n := 0
+	if w.availBits > 0 {
+		w.enc.add(final, &w.index, &w.offset, &w.availBits, &n)
+	}
+	if padLen > 0 {
+		padWord := *w.enc.padding
+		for range padLen {
+			final[n] = padWord
+			n++
+		}
+	}
+
+	written, err := w.w.Write(final[:n])
+	if err != nil {
+		return err
+	}
+	if written != n {
+		return io.ErrShortWrite
+	}
+
+	return nil
 }
 
 type reader[Dict ~[]Word, Word comparable] struct {
@@ -252,6 +435,13 @@ type reader[Dict ~[]Word, Word comparable] struct {
 	offset      uint64
 	partial     byte
 	partialBits uint8
+	out         []byte
+	outOff      int
+	err         error
+	sawPadding  bool
+	padCount    int
+	payloadLen  int
+	tail        []byte
 }
 
 func NewReader[Dict ~[]Word, Word comparable](enc *Encoding[Dict, Word], r interface {
@@ -264,19 +454,160 @@ func NewReader[Dict ~[]Word, Word comparable](enc *Encoding[Dict, Word], r inter
 }
 
 func (r *reader[Dict, Word]) Read(p []byte) (n int, err error) {
-	n = r.enc.encodedLen(len(p), 0)
-	if n > 0 && r.partialBits > 0 {
-		n--
+	if len(p) == 0 {
+		return 0, nil
 	}
 
-	r.buf = slices.Grow(r.buf, n)
+	for {
+		if r.outOff < len(r.out) {
+			n = copy(p, r.out[r.outOff:])
+			r.outOff += n
+			return n, nil
+		}
+		if r.err != nil {
+			return 0, r.err
+		}
 
-	n, err = r.r.Read(r.buf[len(r.buf):][:n])
+		r.out = r.out[:0]
+		r.outOff = 0
+		if r.enc.padding != nil {
+			r.err = r.fillPadded()
+		} else {
+			r.err = r.fillRaw()
+		}
+	}
+}
+
+func (r *reader[Dict, Word]) fillRaw() error {
+	const readLen = 1024
+
+	r.buf = slices.Grow(r.buf[:0], readLen)
+	n, err := r.r.Read(r.buf[:readLen])
+	if n > 0 {
+		if decodeErr := r.decodeWords(r.buf[:n]); decodeErr != nil {
+			return decodeErr
+		}
+	}
+	if err == io.EOF {
+		if closeErr := r.Close(); closeErr != nil {
+			return closeErr
+		}
+		return io.EOF
+	}
 	if err != nil {
-		return n, err
+		return err
+	}
+	if n == 0 {
+		return io.ErrNoProgress
 	}
 
-	return r.enc.decode(p, r.buf[:len(r.buf)+n], &r.offset, &r.partial, &r.partialBits)
+	return nil
+}
+
+func (r *reader[Dict, Word]) fillPadded() error {
+	const readLen = 1024
+
+	r.buf = slices.Grow(r.buf[:0], readLen)
+	n, err := r.r.Read(r.buf[:readLen])
+	if n > 0 {
+		if decodeErr := r.decodePaddedWords(r.buf[:n]); decodeErr != nil {
+			return decodeErr
+		}
+	}
+	if err == io.EOF {
+		if closeErr := r.finishPadded(); closeErr != nil {
+			return closeErr
+		}
+		return io.EOF
+	}
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return io.ErrNoProgress
+	}
+
+	return nil
+}
+
+func (r *reader[Dict, Word]) decodePaddedWords(words []Word) error {
+	padWord := *r.enc.padding
+	for i, word := range words {
+		if word == padWord {
+			r.sawPadding = true
+			r.padCount++
+			continue
+		}
+		if r.sawPadding {
+			return fmt.Errorf("padding word at index %d before end", r.payloadLen)
+		}
+
+		r.payloadLen++
+		if err := r.decodeWords(words[i : i+1]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *reader[Dict, Word]) decodeWords(words []Word) error {
+	lenBits := (len(words) * int(r.enc.stepBits)) + int(r.partialBits)
+	if lenBits < 8 {
+		var tmp [8]byte
+		n, err := r.enc.decode(tmp[:], words, &r.offset, &r.partial, &r.partialBits)
+		r.appendDecoded(tmp[:n])
+		return err
+	}
+
+	decoded := make([]byte, lenBits/8)
+	n, err := r.enc.decode(decoded, words, &r.offset, &r.partial, &r.partialBits)
+	r.appendDecoded(decoded[:n])
+	return err
+}
+
+func (r *reader[Dict, Word]) appendDecoded(decoded []byte) {
+	if r.enc.padding == nil || r.enc.stepBits <= 8 {
+		r.out = append(r.out, decoded...)
+		return
+	}
+
+	hold := int(r.enc.stepBits / 8)
+	r.tail = append(r.tail, decoded...)
+	if len(r.tail) <= hold {
+		return
+	}
+
+	emit := len(r.tail) - hold
+	r.out = append(r.out, r.tail[:emit]...)
+	copy(r.tail, r.tail[emit:])
+	r.tail = r.tail[:len(r.tail)-emit]
+}
+
+func (r *reader[Dict, Word]) finishPadded() error {
+	if err := r.enc.validatePadding(r.payloadLen, r.padCount); err != nil {
+		return err
+	}
+	if err := r.Close(); err != nil {
+		return err
+	}
+	if r.enc.stepBits <= 8 {
+		return nil
+	}
+	if r.padCount > len(r.tail) {
+		return fmt.Errorf("padding removes %d bytes from %d pending decoded bytes", r.padCount, len(r.tail))
+	}
+
+	stripFrom := len(r.tail) - r.padCount
+	for i := stripFrom; i < len(r.tail); i++ {
+		if r.tail[i] != 0 {
+			return fmt.Errorf("non-zero byte %08b removed by padding at decoded index %d", r.tail[i], i)
+		}
+	}
+
+	r.out = append(r.out, r.tail[:stripFrom]...)
+	r.tail = r.tail[:0]
+	return nil
 }
 
 func (r *reader[Dict, Word]) Close() error {
